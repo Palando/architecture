@@ -5,8 +5,7 @@
 | Date            | 2026-09-18                                                               |
 | Supersedes      | [ADR 002](002-apiexport-binding-access-control.md) (decision 3 only)     |
 | Decision-makers | Platform Mesh TSC                                                        |
-| Epic            | [platform-mesh/backlog#381](https://github.com/platform-mesh/backlog/issues/381) |
-| Related         | [RFC 008](../rfc/008-platform-mesh-modularization.md), [RFC 010](../rfc/010-provider-permissions-configuration.md), [ADR 011](011-mcp-server-for-kcp-and-platform-mesh.md) |
+| Related         | [RFC 008](../rfc/008-platform-mesh-modularization.md), [RFC 010](../rfc/010-provider-permissions-configuration.md), [ADR 011](011-mcp-server-for-kcp-and-platform-mesh.md), [ADR 014](014-authentication-api-surface-and-provisioning-modes.md) |
 
 ## Context and Problem Statement
 
@@ -139,7 +138,7 @@ spec:
   subjects:
     - kind: User                # User | Group | ServiceAccount
       name: "acme:alice@example.com"
-      issuerRef: acme           # the AuthenticationConfig that vouches for this name (ADR 013)
+      issuerRef: acme           # the AuthenticationConfig that vouches for this name (ADR 014)
   roleRef:
     name: httpbin-codeviewer
   scope:
@@ -348,8 +347,6 @@ optional first, populated by the projector for one release, then removed.
 
 * [RFC 008 — A Modular Framework for Platform Mesh](../rfc/008-platform-mesh-modularization.md)
 * [RFC 010 — Provider Permissions Configuration](../rfc/010-provider-permissions-configuration.md)
-  (note: this file's heading currently reads "RFC 008")
 * [ADR 002 — Fine-Grained Access Control for APIExport Binding](002-apiexport-binding-access-control.md)
 * [ADR 011 — MCP Server for kcp and Platform Mesh](011-mcp-server-for-kcp-and-platform-mesh.md)
-* [ADR 013 — Authentication API Surface and Provisioning Modes](014-authentication-api-surface-and-provisioning-modes.md)
-* [backlog#381 — epic: Authorization as a pluggable module](https://github.com/platform-mesh/backlog/issues/381)
+* [ADR 014 — Authentication API Surface and Provisioning Modes](014-authentication-api-surface-and-provisioning-modes.md)
