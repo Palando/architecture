@@ -117,11 +117,12 @@ spec:
     certificateAuthorityRef:
       name: domain-ca
       key: tls.crt
-  identity:                       # required — there is no implicit default
+  identity:
     usernameClaim: sub
-    usernamePrefix: "acme:"       # required, non-empty, immutable
+    usernamePrefix: "acme:"       # optional; defaults to "<organization-name>:" — see below.
+                                   # Once resolved onto status, non-empty and immutable.
     groupsClaim: groups
-    groupsPrefix: "acme:"
+    groupsPrefix: "acme:"         # same default and invariant as usernamePrefix
   clients:
     - name: portal
       type: public                # public | confidential
@@ -157,6 +158,28 @@ platform-level one applies; if neither exists, organization initialization **fai
 rather than falling back to a built-in default. `status.effectiveFrom` records which one applied, so
 the mode is observable rather than inferred.
 
+**Where each object lives.** An organization-scoped `AuthenticationConfig` lives *inside* the
+organization's own workspace (e.g. `root:orgs:acme`) — the same workspace its tenants already write
+into, reachable through the `authentication.platform-mesh.io` export bound there via
+`defaultAPIBindings`, mirroring [ADR 013](013-engine-neutral-authorization-api.md)'s
+`authorization.platform-mesh.io` export. This is deliberately **not** where the native object lives:
+kcp's `WorkspaceAuthenticationConfiguration` for an organization is a `root:orgs`-scoped resource
+named after the organization, referenced from the organization's `WorkspaceType` — both already true
+today, via `patchWorkspaceTypes`. kcp resolves the authenticator for a workspace from its
+`WorkspaceType`, not from inside the workspace itself, so the native object has to live where the
+`WorkspaceType` can be patched to point at it, which is `root:orgs` — not inside the org.
+
+The `security-operator` bridges the two: it reads the tenant-authored `AuthenticationConfig` from
+inside the organization's workspace — which needs its own read grant into every organization
+workspace, an access requirement this ADR introduces and does not yet fully specify, left to the same
+follow-up as [ADR 013](013-engine-neutral-authorization-api.md)'s access-model open items — and
+writes the resolved `WorkspaceAuthenticationConfiguration` into `root:orgs`, exactly as it does today.
+`AuthenticationConfig` is a friendlier, namespaced-identity-aware **intent** surface;
+`WorkspaceAuthenticationConfiguration` in `root:orgs` remains the only thing kcp actually
+authenticates against — this ADR adds a surface in front of it, not a second authority. The
+platform-level `AuthenticationConfig` (mode 1, and the fallback half of mode 3) lives in
+`root:platform-mesh-system`, where the `security-operator` already operates directly.
+
 This is why the modes are an API concern and not an implementation detail of a provisioner: mode 1
 versus mode 2 determines where the resource lives and how the kcp
 `WorkspaceAuthenticationConfiguration` is derived, and a provisioner cannot decide that on the
@@ -164,9 +187,41 @@ platform's behalf.
 
 ### Identity is namespaced by construction
 
-`spec.identity.usernamePrefix` is **required, non-empty, and immutable**, and an admission webhook
-rejects a second `AuthenticationConfig` claiming a prefix already in use. The same applies to
+`spec.identity.usernamePrefix` is optional in the spec; once resolved onto `status` it is non-empty,
+immutable, and unique across every `AuthenticationConfig` on the platform. The same applies to
 `groupsPrefix`.
+
+**Enforcing that uniqueness at admission does not work.** A webhook validating a new
+`AuthenticationConfig` would need to enumerate every other `AuthenticationConfig` across every
+organization workspace to check for a collision — the same cross-workspace reach [ADR
+013](013-engine-neutral-authorization-api.md) rejects for RBAC materialization, and for the same
+reason: a live `List`/`Watch` grant spanning every tenant workspace, held by an admission webhook, is
+a large blast radius for a small check. Two mechanisms are used instead, matched to how a prefix is
+obtained:
+
+* **Default: the prefix is derived, not chosen.** `usernamePrefix` defaults to
+  `<organization-name>:`, where `<organization-name>` is the `Account`'s name in `root:orgs` —
+  already guaranteed unique by kcp's own name uniqueness within that workspace. No admission check,
+  no new resource, and no cross-workspace read: the `security-operator` already has whatever access
+  it needs to read the `Account` it is reconciling.
+* **Opt-in: a custom prefix goes through a claim.** `PrefixClaim.authentication.platform-mesh.io` is
+  a cluster-scoped resource in `root:platform-mesh-system` whose `metadata.name` *is* the prefix.
+  Turning "is this prefix free" into a single `Create` lets the API server's own name-uniqueness
+  guarantee answer it — no list, no lock, the same technique Kubernetes uses for `ClusterIP` and
+  `Namespace` allocation. **Only the `security-operator` creates `PrefixClaim` objects**, while
+  resolving an `AuthenticationConfig` that requests a non-default prefix — never the tenant directly,
+  and never from a webhook. A tenant can *request* a prefix; it cannot *mint* one. This closes the
+  squatting gap a tenant-writable claim would open (an org claiming `acme:` before the real `acme`
+  organization exists), at the cost of the request going through a reconcile rather than resolving
+  synchronously. Because the `security-operator` already obtains clients for arbitrary logical
+  clusters (it already reconciles `root:platform-mesh-system` and `root:orgs`), writing a
+  `PrefixClaim` needs no new access grant, unlike the org-workspace read introduced below.
+  `PrefixClaim.spec.claimant` records the requesting `AuthenticationConfig`'s workspace path and
+  name — a cross-workspace reference cannot be a Kubernetes owner reference — and the
+  `security-operator` places a finalizer on the `AuthenticationConfig` that releases the claim on
+  deletion. Whether a released prefix should be reusable immediately or held for a cooldown is an
+  open decision below; reuse here is lower-risk than the RBAC materialization case, because deleting
+  an organization tears down every principal that held its prefix, unlike a stale `RoleBinding`.
 
 `alice@example.com` authenticated through issuer `acme` is the kcp principal
 `acme:alice@example.com`; through a different issuer it is a different principal — in kcp
@@ -280,11 +335,18 @@ in an amendment to ADR 008.
   and does not disturb the previous configuration.
 * A test asserting that a change removing the last working issuer for a workspace is rejected.
 * No `cfg.Keycloak.*` configuration remains in the `security-operator` (mechanically checkable).
+* A test asserting that only the `security-operator`'s identity can create `PrefixClaim` objects —
+  no path exists for a tenant-held identity to create one directly.
+* A test asserting that two organizations left at their default prefix never collide, without any
+  admission check running (the derivation, not enforcement, is what is being tested).
 
 ## Open decisions for the TSC
 
-1. **Prefix scope.** Per issuer (recommended — it is what actually prevents collision) or per
-   organization (which still collides if one organization adds a second issuer)?
+1. ~~**Prefix scope.**~~ **Resolved by the derived-prefix design above:** each `AuthenticationConfig`
+   gets a unique prefix by construction (derived from its organization's name, or an explicitly
+   claimed one), and v1 allows at most one `AuthenticationConfig` per organization, so per-issuer and
+   per-organization coincide. Revisit only if a later version allows more than one issuer per
+   organization.
 2. **`usernameClaim` default.** `sub` (recommended, stable and opaque) or `email` (current,
    readable, but mutable and reassignable)?
 3. **Where `External` mode lives.** A subroutine of the `security-operator` (recommended — it is
@@ -298,6 +360,13 @@ in an amendment to ADR 008.
 6. **`AuthenticationCapabilities`.** A status-only singleton as proposed, or folded into the
    `PlatformMesh` resource's status — same question as ADR 013 raises, and it should be answered the
    same way in both.
+7. **Prefix reuse cooldown.** Let a released `PrefixClaim` name be reused immediately (recommended —
+   deleting an organization already removes every principal that held its prefix), or hold it for a
+   cooldown window?
+8. **`security-operator` read access into every organization workspace.** Introduced above to read
+   tenant-authored `AuthenticationConfig`; the exact claim shape is left to the same access-model
+   follow-up as [ADR 013](013-engine-neutral-authorization-api.md)'s open items. Confirm that
+   follow-up covers both ADRs rather than each specifying its own mechanism.
 
 ## References
 
